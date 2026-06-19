@@ -1,30 +1,70 @@
 """
-PercentageDiscount — e.g., 20% off the subtotal.
+PaymentGateway — abstract + two mock implementations.
 
-Examples:
-    PercentageDiscount(Decimal("0.20")).apply(Money(1000, "INR"), ctx)  ->  Money(200, "INR")
-    PercentageDiscount(Decimal("1.00")).apply(Money(500, "INR"), ctx)   ->  Money(500, "INR")  # 100% off
+In real life this would talk to Stripe / Razorpay / Adyen. For the project
+we use mocks so tests are deterministic and the demo never hits the network.
 """
 
-from decimal import Decimal
+from __future__ import annotations
 
-from numpy import percentile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
 
-from billing_engine.money import Money
-from billing_engine.discounts.base import Discount, DiscountContext
+from billing_engine.models import Invoice
 
 
-class PercentageDiscount(Discount):
+@dataclass(frozen=True)
+class PaymentResult:
+    success: bool
+    failure_reason: Optional[str] = None
 
-    def __init__(self, percentage: Decimal) -> None:
 
-        if not isinstance(percentage, Decimal):
-            raise TypeError("percentage must be Decimal")
+class PaymentGateway(ABC):
+    @abstractmethod
+    def charge(self, invoice: Invoice) -> PaymentResult:
+        raise NotImplementedError
 
-        if percentage < Decimal("0") or percentage > Decimal("1"):
-            raise ValueError("percentage must be between 0 and 1")
 
-        self.percentage = percentage
+# ----------------------------------------------------------------
+# Scripted — for deterministic tests
+# ----------------------------------------------------------------
+class ScriptedGateway(PaymentGateway):
+    """Returns pre-set results from a queue. Used in tests.
 
-    def apply(self, subtotal: Money, context: DiscountContext) -> Money:
-        return subtotal * self.percentage
+    Example:
+        gateway = ScriptedGateway([
+            PaymentResult(False, "INSUFFICIENT_FUNDS"),
+            PaymentResult(False, "INSUFFICIENT_FUNDS"),
+            PaymentResult(True),
+        ])
+    """
+
+    def __init__(self, results: list[PaymentResult]) -> None:
+     self.results = list(results)
+
+    def charge(self, invoice: Invoice) -> PaymentResult:
+     if not self.results:
+        raise RuntimeError("No scripted payment results remaining")
+
+     return self.results.pop(0)
+
+
+# ----------------------------------------------------------------
+# Fake-random — for the CLI demo
+# ----------------------------------------------------------------
+import random 
+class FakeRandomGateway(PaymentGateway):
+    """Succeeds at a configurable rate; seeded for reproducibility."""
+
+    def __init__(self, success_rate: float = 0.7, seed: Optional[int] = None) -> None:
+        self.success_rate = success_rate
+        self.random = random.Random(seed)
+    def charge(self, invoice: Invoice) -> PaymentResult:
+        if self.random.random() < self.success_rate:
+         return PaymentResult(True)
+
+        return PaymentResult(
+        False,
+        "RANDOM_FAILURE",
+    )
