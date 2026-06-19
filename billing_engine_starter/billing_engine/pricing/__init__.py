@@ -1,15 +1,23 @@
-"""Pricing strategies. Implement each subclass in its own file."""
-from .base import PricingStrategy
-from .flat import FlatRate
-from .usage import UsageBased
-from .tiered import TieredPricing, Tier
-from .freemium import Freemium
+"""
+FlatRate — same charge every period regardless of usage.
 
-__all__ = [
-    "PricingStrategy",
-    "FlatRate",
-    "UsageBased",
-    "TieredPricing",
-    "Tier",
-    "Freemium",
-]
+Example: ₹999/month subscription, no matter how much the customer uses.
+"""
+
+from billing_engine.money import Money
+from billing_engine.pricing.base import PricingStrategy
+
+
+class FlatRate(PricingStrategy):
+
+    def __init__(self, amount: Money) -> None:
+        if not isinstance(amount, Money):
+            raise TypeError("amount must be Money")
+
+        if amount.is_negative():
+            raise ValueError("amount cannot be negative")
+
+        self.amount: Money = amount
+
+    def calculate(self, quantity: int) -> Money:
+        return self.amount
