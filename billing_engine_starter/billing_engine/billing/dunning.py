@@ -1,187 +1,174 @@
 """
-BillingCycle — finds due subscriptions, generates invoices, posts ledger DEBITs,
-advances the subscription period. Must be IDEMPOTENT (safe to run twice).
+DunningProcess — finite state machine for failed-payment retries.
+
+States:
+    PENDING       (initial)  →  RETRYING  on first failure
+    RETRYING      ──→ SUCCEEDED    when a retry succeeds
+                  ──→ FAILED_FINAL after 3 total failures
+    SUCCEEDED     (terminal)
+    FAILED_FINAL  (terminal — also flips subscription to PAST_DUE)
+
+Retry schedule:
+    attempt 2 scheduled at  now + 1 day
+    attempt 3 scheduled at  now + 3 days
+    (no attempt 4 — after the 3rd failure we mark FAILED_FINAL)
+
+After the subscription has been PAST_DUE for 7 days with no recovery,
+the BillingCycle.run (Day 2 work) may flip it to CANCELLED — that
+transition does NOT live in this file.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
-from operator import sub
-from typing import Callable, Optional, Self
+from datetime import date, datetime, timedelta
+from enum import Enum
+from typing import Optional
 
 from billing_engine.db import (
-    Database,
-    CustomerRepository, PlanRepository, SubscriptionRepository,
-    UsageRecordRepository, InvoiceRepository, InvoiceLineItemRepository,
-    LedgerRepository,
+    InvoiceRepository, LedgerRepository, SubscriptionRepository,
+    PaymentAttemptRepository,
 )
-from billing_engine.models import Subscription
-from billing_engine_starter.billing_engine.models import customer
-from billing_engine_starter.billing_engine.models.invoice import Invoice
-from billing_engine_starter.billing_engine.models.ledger import LedgerEntry
-from datetime import timedelta
-
-from billing_engine.billing.pipeline import build_invoice
-from billing_engine.models import (
-    InvoiceStatus,
-    LedgerEntry,
-    LedgerDirection,
-    SubscriptionStatus,
-)
-
-@dataclass
-class BillingResult:
-    invoices_created: int
-    invoices_skipped_duplicate: int
-    trials_activated: int
+from billing_engine.models import Invoice, LedgerEntry, LedgerDirection, SubscriptionStatus
+from billing_engine.payments.gateway import PaymentGateway, PaymentResult
 
 
-class BillingCycle:
-    """Day-3 deliverable. Day-4 stretch: add `upgrade_subscription(...)`."""
+class DunningState(str, Enum):
+    PENDING = "PENDING"
+    RETRYING = "RETRYING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED_FINAL = "FAILED_FINAL"
 
+
+@dataclass(frozen=True)
+class DunningOutcome:
+    state: DunningState
+    attempt_no: int
+    next_retry_at: Optional[datetime]
+
+
+# Retry intervals (in days) after each failure, indexed by attempt_no JUST COMPLETED.
+# After failure of attempt 1, schedule attempt 2 at +1 day.
+# After failure of attempt 2, schedule attempt 3 at +3 days.
+# After failure of attempt 3, no more retries → FAILED_FINAL.
+RETRY_DELAYS_DAYS = {1: 1, 2: 3}
+MAX_ATTEMPTS = 3
+
+
+class DunningProcess:
     def __init__(
         self,
-        db: Database,
-        customer_repo: CustomerRepository,
-        plan_repo: PlanRepository,
-        subscription_repo: SubscriptionRepository,
-        usage_repo: UsageRecordRepository,
+        gateway: PaymentGateway,
         invoice_repo: InvoiceRepository,
-        line_item_repo: InvoiceLineItemRepository,
         ledger_repo: LedgerRepository,
-        strategy_factory: Callable,    # given a Plan, returns a PricingStrategy
-        discount_factory: Callable,    # given a discount_id or None, returns a Discount or None
-        tax_factory: Callable,         # given a Customer, returns (TaxCalculator, TaxContext)
+        subscription_repo: SubscriptionRepository,
+        attempt_repo: PaymentAttemptRepository,
     ) -> None:
-        self.db = db
-        self.customer_repo = customer_repo
-        self.plan_repo = plan_repo
-        self.subscription_repo = subscription_repo
-        self.usage_repo = usage_repo
+        self.gateway = gateway
         self.invoice_repo = invoice_repo
-        self.line_item_repo = line_item_repo
         self.ledger_repo = ledger_repo
-        self.strategy_factory = strategy_factory
-        self.discount_factory = discount_factory
-        self.tax_factory = tax_factory
+        self.subscription_repo = subscription_repo
+        self.attempt_repo = attempt_repo
 
-    # --------------------------------------------------------
-    def run(self, as_of: date) -> BillingResult:
+    def attempt(
+    self,
+    invoice: Invoice,
+    customer_id: int,
+    now: datetime,
+) -> DunningOutcome:
 
-     invoices_created = 0
-     invoices_skipped_duplicate = 0
-     trials_activated = 0
-
-    # activate trials
-     for sub in self.subscription_repo.list_all():
-
-        if (
-             sub.status == SubscriptionStatus.TRIAL
-             and sub.trial_end
-             and sub.trial_end < as_of
-        ):
-            self.subscription_repo.update_status(
-                sub.id,
-                SubscriptionStatus.ACTIVE,
-            )
-
-            trials_activated += 1
-
-     due_subscriptions = self.subscription_repo.get_due_for_billing(
-        as_of
+     attempt_no = (
+        self.attempt_repo.count_for_invoice(
+            invoice.id
+        )
+        + 1
     )
 
-     for sub in due_subscriptions:
+     result = self.gateway.charge(invoice)
 
-        if (
-            self.invoice_repo.count_for_subscription(
-                sub.id
-            )
-            > 0
-        ):
-            invoices_skipped_duplicate += 1
-            continue
+     if result.success:
 
-        customer = self.customer_repo.get(
-            sub.customer_id
+        self.invoice_repo.mark_paid(
+            invoice.id
         )
 
-        plan = self.plan_repo.get(
-            sub.plan_id
-        )
-
-        strategy = self.strategy_factory(plan)
-
-        discount = self.discount_factory(
-            sub.discount_id
-        )
-
-        tax_calc, tax_context = self.tax_factory(
-            customer
-        )
-
-        usage_quantity = self.usage_repo.sum_for_period(
-            sub.id,
-            "calls",
-            sub.current_period_start,
-            sub.current_period_end,
-        )
-
-     invoice = build_invoice(
-            subscription=sub,
-            plan=plan,
-            strategy=strategy,
-            discount=discount,
-            tax_calc=tax_calc,
-            tax_context=tax_context,
-            usage_quantity=usage_quantity,
-            period_start=sub.current_period_start,
-            period_end=sub.current_period_end,
-            invoice_count_so_far=self.invoice_repo.count_for_subscription(
-                sub.id
-            ),
-        )
-
-     invoice.status = InvoiceStatus.ISSUED
-
-    invoice =Self.invoice_repo.add(
-            Invoice
-        )
-
-    for item in invoice.line_items:
-
-            Self.line_item_repo.add(
-                item.__class__(
-                    id=None,
-                    invoice_id=invoice.id,
-                    description=item.description,
-                    amount=item.amount,
-                    kind=item.kind,
-                )
-            )
-
-    Self.ledger_repo.add(
+        self.ledger_repo.add(
             LedgerEntry(
                 id=None,
                 invoice_id=invoice.id,
-                customer_id=customer.id,
+                customer_id=customer_id,
                 amount=invoice.total,
-                direction=LedgerDirection.DEBIT,
-                reason=f"Invoice {invoice.id}",
+                direction=LedgerDirection.CREDIT,
+                reason=f"Payment for invoice {invoice.id}",
             )
         )
 
-    Self.subscription_repo.update_period(
-            sub.id,
-            sub.current_period_end,
-            sub.current_period_end + timedelta(days=28),
+        self.attempt_repo.add(
+            invoice.id,
+            attempt_no,
+            "SUCCESS",
+            None,
+            None,
         )
 
- 
+        return DunningOutcome(
+            DunningState.SUCCEEDED,
+            attempt_no,
+            None,
+        )
 
+     if attempt_no >= MAX_ATTEMPTS:
+
+        self.invoice_repo.mark_failed(
+            invoice.id
+        )
+
+        self.subscription_repo.update_status(
+            invoice.subscription_id,
+            SubscriptionStatus.PAST_DUE,
+            past_due_since=now.date(),
+        )
+
+        self.attempt_repo.add(
+            invoice.id,
+            attempt_no,
+            "FAILED",
+            result.failure_reason,
+            None,
+        )
+
+        return DunningOutcome(
+            DunningState.FAILED_FINAL,
+            attempt_no,
+            None,
+        )
+
+     delay = RETRY_DELAYS_DAYS[attempt_no]
+
+     next_retry = now + timedelta(days=delay)
+
+     self.attempt_repo.add(
+        invoice.id,
+        attempt_no,
+        "FAILED",
+        result.failure_reason,
+        next_retry,
+    )
+
+     return DunningOutcome(
+        DunningState.RETRYING,
+        attempt_no,
+        next_retry,
+    )
     # --------------------------------------------------------
-    def upgrade_subscription(self, subscription_id: int, new_plan_id: int, switch_date: date) -> None:
-        """Mid-cycle upgrade — Day 4 stretch."""
-        # TODO Day 4
-        raise NotImplementedError("Day 4: implement BillingCycle.upgrade_subscription")
+    @staticmethod
+    @staticmethod
+    def should_cancel(
+    past_due_since: date,
+    today: date,
+    grace_days: int = 7,
+) -> bool:
+
+     return (
+        today - past_due_since
+    ).days >= grace_days
